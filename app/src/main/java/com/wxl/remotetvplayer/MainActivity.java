@@ -118,6 +118,7 @@ public final class MainActivity extends Activity {
         if (mode == 2) { mode = 1; renderer = 2; }
         if (mode < 0 || mode > 1) mode = 0;
         if (renderer < 0 || renderer > 2) renderer = 1;
+        getPreferences(MODE_PRIVATE).edit().putInt("decoderMode", mode).putInt("rendererMode", renderer).apply();
         // An interrupted process may be a native crash, force-stop or device reboot.
         // It is evidence of an unclean session, not a diagnosis of its cause.
         recoveryRequired = getPreferences(MODE_PRIVATE).getBoolean("sessionActive", false);
@@ -417,7 +418,7 @@ public final class MainActivity extends Activity {
         }
         IMedia.Stats stats = playbackStats();
         text.append('\n').append(compact(subtitleStatus));
-        text.append("\n1.2.2 · LibVLC 3.7.7 · Android ").append(android.os.Build.VERSION.RELEASE);
+        text.append("\n1.2.3 · LibVLC 3.7.7 · Android ").append(android.os.Build.VERSION.RELEASE);
         if (stats != null) text.append("\n视频解码 / 显示：").append(String.valueOf(stats.decodedVideo)).append(" / ")
                 .append(String.valueOf(stats.displayedPictures)).append("  音频解码 / 输出：")
                 .append(String.valueOf(stats.decodedAudio)).append(" / ").append(String.valueOf(stats.playedAbuffers));
@@ -646,10 +647,13 @@ public final class MainActivity extends Activity {
         ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
         manager.getMemoryInfo(info);
         long javaBytes = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+        long nativeBytes = Debug.getNativeHeapAllocatedSize();
         memoryStatus = String.format(Locale.ROOT, "系统可用 %d MB · Java / 原生堆 %d / %d MB",
-                info.availMem / 1048576, javaBytes / 1048576, Debug.getNativeHeapAllocatedSize() / 1048576);
+                info.availMem / 1048576, javaBytes / 1048576, nativeBytes / 1048576);
         if (player != null) getPreferences(MODE_PRIVATE).edit().putString("lastMemory", memoryStatus).apply();
-        if (info.lowMemory && player != null) stopForSafety("系统报告低内存，已停止并释放播放器；按 ↓ 可手动重试");
+        if (player != null && info.totalMem > 0 && nativeBytes + javaBytes > info.totalMem / 2)
+            stopForSafety("播放器堆占用超过系统总内存一半，已停止以预留系统余量；请改用硬解或更低分辨率片源");
+        else if (info.lowMemory && player != null) stopForSafety("系统报告低内存，已停止并释放播放器；按 ↓ 可手动重试");
     }
 
     private void stopForSafety(String reason) {
