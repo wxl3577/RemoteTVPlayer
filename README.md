@@ -53,7 +53,7 @@ English|http://82.156.239.39/subtitles/movie.en.vtt
 
 ## 构建与验证
 
-JDK 17、Android SDK 35、Gradle 8.11.1、AGP 8.9.2、LibVLC 3.7.7。
+JDK 17、Android SDK 36、Gradle 8.11.1、AGP 8.9.2、LibVLC 3.7.7。
 
 ```sh
 ./gradlew testDebugUnitTest lintDebug assembleDebug
