@@ -21,6 +21,7 @@ import static org.junit.Assert.assertNotNull;
 
 /** Tests decoded HEVC Main10 frames on a real surface and E-AC-3 PCM audio buffers. */
 @RunWith(AndroidJUnit4.class)
+@androidx.test.filters.SdkSuppress(minSdkVersion = 19)
 public class SubtitlePlaybackTest {
     @Test public void softwareSurfaceProducesPictureAudioAndSubtitle() throws Exception { verifyPlayback(1); }
     @Test public void softwareTextureProducesPictureAudioAndSubtitle() throws Exception { verifyPlayback(2); }
