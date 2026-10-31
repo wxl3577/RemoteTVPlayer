@@ -44,7 +44,7 @@ import java.util.concurrent.Future;
 /** TV-only directional controls, with bundled HEVC and E-AC-3 software decoders. */
 public final class MainActivity extends Activity {
     private static final String HELP = "← / → 快退 / 快进 10 秒    ↓ 暂停 / 继续    ↑ 字幕与解码设置";
-    private static final int ROWS = 9;
+    private static final int ROWS = 10;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService network = Executors.newSingleThreadExecutor();
     private final ExecutorService subtitles = Executors.newSingleThreadExecutor();
@@ -59,7 +59,7 @@ public final class MainActivity extends Activity {
     private Future<?> sourceRequest, subtitleRequest, probeRequest;
     private boolean active, menuOpen, wantPlay = true;
     private boolean listLoaded, externalAdded, appliedPause;
-    private int generation, listGeneration, menuRow, mode, textSelection = 1, failures;
+    private int generation, listGeneration, menuRow, mode, renderer, textSelection = 1, failures;
     private int desiredAudio = Integer.MIN_VALUE;
     private int desiredSubtitle = Integer.MIN_VALUE;
     private long savedPosition, pendingSeek, sampleAt, previousRead, previousFrames;
@@ -114,7 +114,10 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         mode = getPreferences(MODE_PRIVATE).getInt("decoderMode", 0);
-        if (mode < 0 || mode > 2) mode = 0;
+        renderer = getPreferences(MODE_PRIVATE).getInt("rendererMode", 1);
+        if (mode == 2) { mode = 1; renderer = 2; }
+        if (mode < 0 || mode > 1) mode = 0;
+        if (renderer < 0 || renderer > 2) renderer = 1;
         // An interrupted process may be a native crash, force-stop or device reboot.
         // It is evidence of an unclean session, not a diagnosis of its cause.
         recoveryRequired = getPreferences(MODE_PRIVATE).getBoolean("sessionActive", false);
@@ -167,18 +170,40 @@ public final class MainActivity extends Activity {
         active = true;
         audioManager = (AudioManager)getSystemService(AUDIO_SERVICE);
         try {
-            engine = new LibVLC(this, new ArrayList<>(Arrays.asList(
-                    "--aout=opensles", "--stats", "--no-video-title-show",
-                    "--subsdec-encoding=UTF-8", "--sub-language=zh,chi,zho")));
+            engine = createEngine();
             if (recoveryRequired) {
                 safetyStopped = true; wantPlay = false;
                 status = "上次播放未正常结束，已停止自动播放";
                 show(status + "\n" + previousSession + "\n按 ↓ 手动重试，或按 ↑ 更换解码方式", false);
-            } else loadSource(false);
+            } else if (currentUrl != null) startPlayback(savedPosition);
+            else loadSource(false);
         } catch (RuntimeException | UnsatisfiedLinkError error) {
             show("兼容内核启动失败，请尝试对应 CPU 的 ARM32 / ARM64 安装包", false);
         }
         main.postDelayed(ticker, 1000);
+    }
+
+    private LibVLC createEngine() {
+        // Set worker limits at engine creation, so they apply before any decoder
+        // is opened. Do not override the core's normal network buffering defaults.
+        return new LibVLC(this, new ArrayList<>(Arrays.asList(
+                "--aout=opensles", "--stats", "--no-video-title-show", "--avcodec-threads=2",
+                "--no-mediacodec-audio", renderer == 0 ? "--vout=android_display,none" : "--vout=gles2,none",
+                "--subsdec-encoding=UTF-8", "--sub-language=zh,chi,zho")));
+    }
+
+    void setRendererMode(int value) {
+        if (renderer == value) return;
+        long at = position();
+        renderer = value;
+        getPreferences(MODE_PRIVATE).edit().putInt("rendererMode", renderer).apply();
+        if (!active || engine == null) return;
+        stopPlayer(); engine.release(); engine = createEngine();
+        if (currentUrl != null) startPlayback(at);
+    }
+
+    private String rendererName() {
+        return renderer == 0 ? "原生 Surface" : renderer == 1 ? "OpenGL + Surface" : "OpenGL + Texture";
     }
 
     private void loadSource(boolean restart) {
@@ -228,13 +253,14 @@ public final class MainActivity extends Activity {
         root.addView(video, 0, new FrameLayout.LayoutParams(-1, -1));
         player = new MediaPlayer(engine);
         player.setAudioOutput("opensles"); // Decoded PCM; no E-AC-3 HDMI passthrough dependency.
-        player.attachViews(video, null, true, mode == 2);
+        // GLES renders subtitles in the same video output; native Surface uses
+        // a separate subtitle Surface. Texture is independent of decoder policy.
+        player.attachViews(video, null, renderer == 0, renderer == 2);
         final MediaPlayer owner = player;
         player.setEventListener(event -> { if (player == owner) onPlayerEvent(event); });
         media = new Media(engine, Uri.parse(currentUrl));
         // Use the core's normal streaming defaults. No extended network cache,
         // disk movie cache, pre-download or automatic reopen.
-        media.addOption(":avcodec-threads=2");
         if (mode == 0) {
             // Select video hardware first but keep software audio available. A
             // global hardware-only codec list also restricts E-AC-3 audio.
@@ -330,7 +356,6 @@ public final class MainActivity extends Activity {
     }
 
     private String decoderName() {
-        if (mode == 2) return "软解 + Texture 画面输出";
         if (mode == 1) return "软件解码（限 2 线程）";
         return "硬解优先（允许回退）";
     }
@@ -377,6 +402,7 @@ public final class MainActivity extends Activity {
             "音轨：‹ " + trackName(false) + " ›（" + tracks(false).size() + " 条）",
             "外挂字幕：‹ " + (externalSubtitle == null ? "不加载" : compact(externalSubtitle.label)) + " ›",
             "解码方式：‹ " + decoderName() + " ›",
+            "画面输出：‹ " + rendererName() + " ›",
             "读取 / 刷新远程字幕列表 →",
             "选择电视或 U 盘字幕文件 →",
             "重新读取视频 / 从头播放 →",
@@ -441,15 +467,17 @@ public final class MainActivity extends Activity {
             if (choices.isEmpty()) subtitleStatus = "请先读取字幕列表或选择本地文件";
             else setExternalSubtitle(selected);
         } else if (menuRow == 3) {
-            setDecoderMode((mode + direction + 3) % 3);
+            setDecoderMode((mode + direction + 2) % 2);
         } else if (menuRow == 4) {
-            loadSubtitleList();
+            setRendererMode((renderer + direction + 3) % 3);
         } else if (menuRow == 5) {
-            chooseLocalSubtitle();
+            loadSubtitleList();
         } else if (menuRow == 6) {
+            chooseLocalSubtitle();
+        } else if (menuRow == 7) {
             failures = 0; safetyStopped = false; recoveryRequired = false;
             closeMenu(); loadSource(true);
-        } else if (menuRow == 7) {
+        } else if (menuRow == 8) {
             probeConnection();
         } else closeMenu();
         if (menuOpen) renderMenu();

@@ -33,6 +33,7 @@ public class StabilityTest {
         }
         try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
             scenario.onActivity(activity -> {
+                activity.setRendererMode(1);
                 activity.setDecoderMode(1);
                 activity.playResolved(Uri.fromFile(video).toString(), 0);
             });

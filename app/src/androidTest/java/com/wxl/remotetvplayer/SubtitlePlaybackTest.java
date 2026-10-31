@@ -40,7 +40,8 @@ public class SubtitlePlaybackTest {
         }
         try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
             scenario.onActivity(activity -> {
-                activity.setDecoderMode(mode);
+                activity.setRendererMode(mode == 2 ? 2 : 0);
+                activity.setDecoderMode(1);
                 activity.setExternalSubtitle(new SubtitleSpec(Uri.fromFile(subtitle).toString(), "外挂测试", "application/x-subrip"));
                 activity.playResolved(Uri.fromFile(video).toString(), 0);
             });

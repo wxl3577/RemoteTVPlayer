@@ -24,7 +24,7 @@ public class RemoteControlTest {
                 for (int i = 0; i < 3; i++) activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN));
                 activity.setDecoderMode(0);
                 activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT));
-                org.junit.Assert.assertTrue(menu.getText().toString().contains("Texture"));
+                org.junit.Assert.assertTrue(menu.getText().toString().contains("限 2 线程"));
                 activity.setDecoderMode(0);
                 for (int i = 0; i < 3; i++) activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_UP));
                 // Up wraps from the subtitle row to Return; right closes, without an OK key.
