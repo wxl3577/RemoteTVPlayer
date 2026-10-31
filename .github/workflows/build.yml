@@ -47,9 +47,12 @@ jobs:
       - name: Prepare APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/RemoteTVPlayer.apk
+          cp app/build/outputs/apk/debug/app-universal-debug.apk dist/RemoteTVPlayer.apk
+          cp app/build/outputs/apk/debug/app-armeabi-v7a-debug.apk dist/RemoteTVPlayer-arm32.apk
+          cp app/build/outputs/apk/debug/app-arm64-v8a-debug.apk dist/RemoteTVPlayer-arm64.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --min-sdk-version 17 dist/RemoteTVPlayer-arm32.apk > dist/signature-verification.txt
           cd dist
-          sha256sum RemoteTVPlayer.apk > SHA256SUMS.txt
+          sha256sum *.apk > SHA256SUMS.txt
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -69,7 +72,8 @@ jobs:
           disable-animations: true
           script: |
             ./gradlew --no-daemon connectedDebugAndroidTest
-            adb shell am start -n com.wxl.remotetvplayer/.MainActivity
+            adb install -r dist/RemoteTVPlayer.apk
+            adb shell am start -W -n com.wxl.remotetvplayer/.MainActivity
             sleep 3
             adb shell input keyevent 19
             sleep 1
@@ -89,9 +93,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="build-${GITHUB_RUN_NUMBER}"
-          printf '%s\n' '启动读取远程 movie.txt 并自动全屏播放。↑ 字幕与音轨设置，↓ 暂停/继续，← → 快退/快进 10 秒。支持内嵌字幕、远程外挂字幕及本地字幕文件。' '' 'Android 5.0+，可直接侧载的测试签名 APK。已通过单元测试、Lint、模拟器方向键和生命周期检查。源站视频有效性与电视实际解码能力需在设备上验证。' > release-notes.md
+          printf '%s\n' '启动读取远程 movie.txt 并自动全屏播放。↑ 字幕与音轨设置，↓ 暂停/继续，← → 快退/快进 10 秒。支持内嵌字幕、远程外挂字幕及本地字幕文件。' '' 'Android 4.2+（安装包最低 API 17），可直接侧载的测试签名 APK。内置 LibVLC，支持 HEVC / E-AC-3 软件解码及 PCM 音频。ARM32 为老款电视安装包，ARM64 为 64 位设备，通用版包含全部架构。已通过单元测试、Lint、模拟器方向键、HEVC Main10 + E-AC-3 实际帧与音频输出检查。源站视频有效性与电视实际解码能力需在设备上验证。' > release-notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/RemoteTVPlayer.apk dist/SHA256SUMS.txt --clobber
+            gh release upload "$tag" dist/*.apk dist/SHA256SUMS.txt dist/signature-verification.txt --clobber
           else
-            gh release create "$tag" dist/RemoteTVPlayer.apk dist/SHA256SUMS.txt --target "$(git rev-parse HEAD)" --title "远程电视播放器（构建 ${GITHUB_RUN_NUMBER}）" --notes-file release-notes.md --prerelease
+            gh release create "$tag" dist/*.apk dist/SHA256SUMS.txt dist/signature-verification.txt --target "$(git rev-parse HEAD)" --title "远程电视播放器（构建 ${GITHUB_RUN_NUMBER}）" --notes-file release-notes.md --prerelease
           fi
