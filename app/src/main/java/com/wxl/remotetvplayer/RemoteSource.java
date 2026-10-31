@@ -6,7 +6,7 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
-import java.nio.charset.StandardCharsets;
+import java.nio.charset.Charset;
 
 /** Reads only a small UTF-8 text file; never decodes or rewrites signed URL query strings. */
 public final class RemoteSource {
@@ -65,7 +65,7 @@ public final class RemoteSource {
                         if (output.size() + count > MAX_BYTES) throw new IOException("movie.txt 超过 64 KB，请只保留视频直链");
                         output.write(buffer, 0, count);
                     }
-                    return new String(output.toByteArray(), StandardCharsets.UTF_8);
+                    return new String(output.toByteArray(), Charset.forName("UTF-8"));
                 }
             } finally {
                 connection.disconnect();

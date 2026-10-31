@@ -1,89 +1,72 @@
 package com.wxl.remotetvplayer;
 
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.net.Uri;
-import androidx.media3.common.C;
-import androidx.media3.common.MediaItem;
-import androidx.media3.common.PlaybackException;
-import androidx.media3.common.Player;
-import androidx.media3.common.text.Cue;
-import androidx.media3.common.text.CueGroup;
-import androidx.media3.exoplayer.ExoPlayer;
+import android.os.SystemClock;
+import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
+import org.videolan.libvlc.interfaces.IMedia;
 import java.io.File;
 import java.io.FileOutputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
+import java.io.InputStream;
+import java.nio.charset.Charset;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertNotNull;
 
-/** Exercises real Media3 subtitle parsing and cue output using tiny, fully local media. */
+/** Tests decoded HEVC Main10 frames on a real surface and E-AC-3 PCM audio buffers. */
 @RunWith(AndroidJUnit4.class)
-@androidx.annotation.OptIn(markerClass = androidx.media3.common.util.UnstableApi.class)
 public class SubtitlePlaybackTest {
-    @Test public void sideloadedSrtProducesVisibleText() throws Exception {
-        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        File wav = new File(context.getCacheDir(), "subtitle-test.wav");
-        File srt = new File(context.getCacheDir(), "subtitle-test.srt");
-        int dataLength = 8000 * 2 * 3;
-        ByteBuffer audio = ByteBuffer.allocate(44 + dataLength).order(ByteOrder.LITTLE_ENDIAN);
-        audio.put("RIFF".getBytes(StandardCharsets.US_ASCII)).putInt(36 + dataLength);
-        audio.put("WAVEfmt ".getBytes(StandardCharsets.US_ASCII)).putInt(16);
-        audio.putShort((short) 1).putShort((short) 1).putInt(8000).putInt(16000);
-        audio.putShort((short) 2).putShort((short) 16);
-        audio.put("data".getBytes(StandardCharsets.US_ASCII)).putInt(dataLength);
-        try (FileOutputStream output = new FileOutputStream(wav)) { output.write(audio.array()); }
-        try (FileOutputStream output = new FileOutputStream(srt)) {
-            output.write("1\n00:00:00,200 --> 00:00:02,800\n外挂字幕测试 Subtitle OK\n\n".getBytes(StandardCharsets.UTF_8));
+    @Test public void softwareSurfaceProducesPictureAudioAndSubtitle() throws Exception { verifyPlayback(1); }
+    @Test public void softwareTextureProducesPictureAudioAndSubtitle() throws Exception { verifyPlayback(2); }
+
+    private void verifyPlayback(int mode) throws Exception {
+        Context target = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        File video = new File(target.getCacheDir(), "compat-hevc10-eac3.mkv");
+        File subtitle = new File(target.getCacheDir(), "compat.srt");
+        try (InputStream input = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("compat-hevc10-eac3.mkv");
+                FileOutputStream output = new FileOutputStream(video)) {
+            byte[] buffer = new byte[8192]; int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
         }
-        CountDownLatch received = new CountDownLatch(1);
-        AtomicReference<String> result = new AtomicReference<>("");
-        AtomicReference<ExoPlayer> playerRef = new AtomicReference<>();
-        try {
-            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-                ExoPlayer player = new ExoPlayer.Builder(context).build();
-                playerRef.set(player);
-                player.setVolume(0);
-                player.addListener(new Player.Listener() {
-                    @Override public void onCues(CueGroup group) {
-                        for (Cue cue : group.cues) {
-                            if (cue.text != null && cue.text.toString().contains("Subtitle OK")) {
-                                result.set(cue.text.toString());
-                                received.countDown();
-                            }
-                        }
-                    }
-                    @Override public void onPlayerError(PlaybackException error) {
-                        result.set(error.getErrorCodeName());
-                        received.countDown();
-                    }
+        try (FileOutputStream output = new FileOutputStream(subtitle)) {
+            output.write("1\n00:00:00,100 --> 00:00:03,900\nHEVC 10-bit + E-AC-3 字幕测试\n\n".getBytes(Charset.forName("UTF-8")));
+        }
+        try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
+            scenario.onActivity(activity -> {
+                activity.setDecoderMode(mode);
+                activity.setExternalSubtitle(new SubtitleSpec(Uri.fromFile(subtitle).toString(), "外挂测试", "application/x-subrip"));
+                activity.playResolved(Uri.fromFile(video).toString(), 0);
+            });
+            AtomicBoolean decoded = new AtomicBoolean();
+            long deadline = SystemClock.elapsedRealtime() + 30000;
+            while (SystemClock.elapsedRealtime() < deadline && !decoded.get()) {
+                scenario.onActivity(activity -> {
+                    IMedia.Stats stats = activity.playbackStats();
+                    decoded.set(stats != null && stats.decodedVideo > 0 && stats.displayedPictures > 0
+                            && stats.decodedAudio > 0 && stats.playedAbuffers > 0 && activity.selectedSubtitle() >= 0);
                 });
-                MediaItem.SubtitleConfiguration subtitle = new MediaItem.SubtitleConfiguration.Builder(Uri.fromFile(srt))
-                        .setId("external").setMimeType("application/x-subrip")
-                        .setSelectionFlags(C.SELECTION_FLAG_DEFAULT).build();
-                player.setTrackSelectionParameters(player.getTrackSelectionParameters().buildUpon()
-                        .setSelectUndeterminedTextLanguage(true).build());
-                player.setMediaItem(new MediaItem.Builder().setUri(Uri.fromFile(wav))
-                        .setSubtitleConfigurations(Collections.singletonList(subtitle)).build());
-                player.prepare();
-                player.play();
-            });
-            assertTrue("Timed out waiting for subtitle cues", received.await(20, TimeUnit.SECONDS));
-            assertEquals("外挂字幕测试 Subtitle OK", result.get());
-        } finally {
-            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-                if (playerRef.get() != null) playerRef.get().release();
-            });
-            wav.delete();
-            srt.delete();
+                if (!decoded.get()) SystemClock.sleep(200);
+            }
+            assertTrue("HEVC Main10 video / E-AC-3 PCM / external subtitles did not all become active, mode=" + mode, decoded.get());
+            Bitmap screen = InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
+            assertNotNull(screen);
+            int coloredPixels = 0;
+            for (int y = screen.getHeight()/3; y < screen.getHeight()*2/3; y += 12) {
+                for (int x = screen.getWidth()/3; x < screen.getWidth()*2/3; x += 12) {
+                    int color = screen.getPixel(x, y);
+                    int max = Math.max(Color.red(color), Math.max(Color.green(color), Color.blue(color)));
+                    int min = Math.min(Color.red(color), Math.min(Color.green(color), Color.blue(color)));
+                    if (max - min > 80 && max > 100) coloredPixels++;
+                }
+            }
+            screen.recycle();
+            assertTrue("No colored test-pattern frame was visible on the screen", coloredPixels > 10);
         }
     }
 }
