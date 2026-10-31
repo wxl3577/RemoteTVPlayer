@@ -1,0 +1,93 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Expand initial source upload
+        run: |
+          if [ -f source.zip ]; then
+            unzip -o source.zip
+            rm source.zip
+            chmod +x gradlew
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "Initialize Android TV player source"
+            git push origin HEAD:main
+          fi
+          chmod +x gradlew
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Restore test signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: tv-debug-signing-${{ github.repository_id }}-v1
+      - name: Install SDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Unit tests, lint, and APK
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Prepare APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/RemoteTVPlayer.apk
+          cd dist
+          sha256sum RemoteTVPlayer.apk > SHA256SUMS.txt
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RemoteTVPlayer-APK
+          path: dist/*
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Emulator remote-control and lifecycle smoke test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          profile: Nexus 6
+          disable-animations: true
+          script: |
+            ./gradlew --no-daemon connectedDebugAndroidTest
+            adb shell am start -n com.wxl.remotetvplayer/.MainActivity
+            sleep 3
+            adb shell screencap -p /sdcard/player.png
+            adb pull /sdcard/player.png dist/player-smoke.png
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-reports
+          path: |
+            app/build/reports/
+            app/build/outputs/androidTest-results/
+            dist/player-smoke.png
+      - name: Publish installable test APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="build-${GITHUB_RUN_NUMBER}"
+          printf '%s\n' '启动读取远程 movie.txt 并自动全屏播放。↑ 重新读取，↓ 暂停/继续，← → 快退/快进 10 秒。' '' 'Android 5.0+，可直接侧载的测试签名 APK。已通过单元测试、Lint、模拟器方向键和生命周期检查。源站视频有效性与电视实际解码能力需在设备上验证。' > release-notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/RemoteTVPlayer.apk dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" dist/RemoteTVPlayer.apk dist/SHA256SUMS.txt --target "$(git rev-parse HEAD)" --title "远程电视播放器 1.0.0（构建 ${GITHUB_RUN_NUMBER}）" --notes-file release-notes.md --prerelease
+          fi
