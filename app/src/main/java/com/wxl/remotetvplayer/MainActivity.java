@@ -1,6 +1,8 @@
 package com.wxl.remotetvplayer;
 
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.os.Debug;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.database.Cursor;
@@ -42,8 +44,7 @@ import java.util.concurrent.Future;
 /** TV-only directional controls, with bundled HEVC and E-AC-3 software decoders. */
 public final class MainActivity extends Activity {
     private static final String HELP = "← / → 快退 / 快进 10 秒    ↓ 暂停 / 继续    ↑ 字幕与解码设置";
-    private static final int ROWS = 10;
-    private static final int[] CACHE_SECONDS = {3, 10, 20};
+    private static final int ROWS = 9;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService network = Executors.newSingleThreadExecutor();
     private final ExecutorService subtitles = Executors.newSingleThreadExecutor();
@@ -58,13 +59,16 @@ public final class MainActivity extends Activity {
     private Future<?> sourceRequest, subtitleRequest, probeRequest;
     private boolean active, menuOpen, wantPlay = true;
     private boolean listLoaded, externalAdded, appliedPause;
-    private int generation, listGeneration, menuRow, mode, cacheIndex, textSelection = 1, failures;
+    private int generation, listGeneration, menuRow, mode, textSelection = 1, failures;
     private int desiredAudio = Integer.MIN_VALUE;
     private int desiredSubtitle = Integer.MIN_VALUE;
     private long savedPosition, pendingSeek, sampleAt, previousRead, previousFrames;
     private float buffering;
-    private boolean probeStarted;
-    private long openedAt;
+    private boolean recoveryRequired, safetyStopped;
+    private long memorySampleAt;
+    private String memoryStatus = "内存：等待采样";
+    private String previousSession = "";
+    private int playerStarts;
     private String connectionStatus = "连接检测：尚未执行";
     private double downloadMbps, displayedFps;
     private String currentUrl, status = "等待远程播放地址", subtitleStatus = "可读取 subtitle.txt 或选择本地字幕";
@@ -89,8 +93,11 @@ public final class MainActivity extends Activity {
                 }
                 sampleAt = now; previousRead = bytes; previousFrames = stats.displayedPictures;
             }
-            if (!probeStarted && wantPlay && stats != null && stats.readBytes == 0
-                    && SystemClock.elapsedRealtime() - openedAt > 20000) probeConnection();
+            long now = SystemClock.elapsedRealtime();
+            if (now - memorySampleAt >= 5000) {
+                memorySampleAt = now;
+                sampleMemory();
+            }
             if (menuOpen) renderMenu();
             main.postDelayed(this, 1000);
         }
@@ -107,7 +114,12 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         mode = getPreferences(MODE_PRIVATE).getInt("decoderMode", 0);
-        cacheIndex = Math.max(0, Math.min(CACHE_SECONDS.length - 1, getPreferences(MODE_PRIVATE).getInt("cacheIndex", 1)));
+        if (mode < 0 || mode > 2) mode = 0;
+        // An interrupted process may be a native crash, force-stop or device reboot.
+        // It is evidence of an unclean session, not a diagnosis of its cause.
+        recoveryRequired = getPreferences(MODE_PRIVATE).getBoolean("sessionActive", false);
+        previousSession = getPreferences(MODE_PRIVATE).getString("lastMemory", "没有上次采样");
+        getPreferences(MODE_PRIVATE).edit().remove("cacheIndex").apply();
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         overlay = new TextView(this);
@@ -158,7 +170,11 @@ public final class MainActivity extends Activity {
             engine = new LibVLC(this, new ArrayList<>(Arrays.asList(
                     "--aout=opensles", "--stats", "--no-video-title-show",
                     "--subsdec-encoding=UTF-8", "--sub-language=zh,chi,zho")));
-            loadSource(false);
+            if (recoveryRequired) {
+                safetyStopped = true; wantPlay = false;
+                status = "上次播放未正常结束，已停止自动播放";
+                show(status + "\n" + previousSession + "\n按 ↓ 手动重试，或按 ↑ 更换解码方式", false);
+            } else loadSource(false);
         } catch (RuntimeException | UnsatisfiedLinkError error) {
             show("兼容内核启动失败，请尝试对应 CPU 的 ARM32 / ARM64 安装包", false);
         }
@@ -166,7 +182,7 @@ public final class MainActivity extends Activity {
     }
 
     private void loadSource(boolean restart) {
-        if (!active || engine == null) return;
+        if (!active || engine == null || safetyStopped) return;
         main.removeCallbacks(retry);
         if (sourceRequest != null) sourceRequest.cancel(true);
         final int ticket = ++generation;
@@ -203,10 +219,9 @@ public final class MainActivity extends Activity {
     }
 
     private void startPlayback(long position) {
-        if (!active || engine == null || currentUrl == null) return;
+        if (!active || engine == null || currentUrl == null || safetyStopped) return;
         if (probeRequest != null) probeRequest.cancel(true);
-        probeStarted = false; connectionStatus = "连接检测：尚未执行";
-        openedAt = SystemClock.elapsedRealtime();
+        connectionStatus = "连接检测：尚未执行";
         stopPlayer();
         if (video != null) root.removeView(video);
         video = new VLCVideoLayout(this);
@@ -214,14 +229,25 @@ public final class MainActivity extends Activity {
         player = new MediaPlayer(engine);
         player.setAudioOutput("opensles"); // Decoded PCM; no E-AC-3 HDMI passthrough dependency.
         player.attachViews(video, null, true, mode == 2);
-        player.setEventListener(this::onPlayerEvent);
+        final MediaPlayer owner = player;
+        player.setEventListener(event -> { if (player == owner) onPlayerEvent(event); });
         media = new Media(engine, Uri.parse(currentUrl));
-        media.addOption(":network-caching=" + CACHE_SECONDS[cacheIndex] * 1000);
-        if (mode == 3) {
-            // No ",all": make unsupported hardware visible instead of silently
-            // decoding a 4K Main10 stream on an old TV's CPU.
-            media.addOption(":codec=" + (android.os.Build.VERSION.SDK_INT >= 21 ? "mediacodec_ndk" : "mediacodec_jni"));
-        } else media.setHWDecoderEnabled(mode == 0, false);
+        // Use the core's normal streaming defaults. No extended network cache,
+        // disk movie cache, pre-download or automatic reopen.
+        media.addOption(":avcodec-threads=2");
+        if (mode == 0) {
+            // Select video hardware first but keep software audio available. A
+            // global hardware-only codec list also restricts E-AC-3 audio.
+            org.videolan.libvlc.util.HWDecoderUtil.Decoder supported = org.videolan.libvlc.util.HWDecoderUtil.getDecoderFromDevice();
+            boolean hardwareAllowed = supported != org.videolan.libvlc.util.HWDecoderUtil.Decoder.NONE
+                    && supported != org.videolan.libvlc.util.HWDecoderUtil.Decoder.UNKNOWN;
+            media.addOption(":codec=" + (hardwareAllowed
+                    ? (android.os.Build.VERSION.SDK_INT >= 21 ? "mediacodec_ndk,all" : "mediacodec_jni,all") : "avcodec,all"));
+        } else {
+            media.addOption(":no-mediacodec");
+            media.addOption(":codec=avcodec,all");
+        }
+        media.addOption(":no-mediacodec-audio");
         media.addOption(":sub-language=zh,chi,zho");
         if (desiredAudio != Integer.MIN_VALUE) media.addOption(":audio-track-id=" + desiredAudio);
         player.setMedia(media);
@@ -232,6 +258,8 @@ public final class MainActivity extends Activity {
         externalAdded = false;
         appliedPause = false;
         player.setVolume(100);
+        playerStarts++;
+        getPreferences(MODE_PRIVATE).edit().putBoolean("sessionActive", true).apply();
         player.play();
         show("正在准备视频（" + decoderName() + "）…\n" + HELP, false);
     }
@@ -256,9 +284,9 @@ public final class MainActivity extends Activity {
         } else if (event.type == MediaPlayer.Event.Buffering) {
             buffering = event.getBuffering();
             status = buffering < 100 ? "正在缓冲 " + (int)buffering + "%" : wantPlay ? "正在播放" : "已暂停";
-            show(status + "（" + decoderName() + "，缓存 " + CACHE_SECONDS[cacheIndex] + " 秒）\n" + HELP, buffering >= 100 && wantPlay);
+            show(status + "（" + decoderName() + "）\n" + HELP, buffering >= 100 && wantPlay);
         } else if (event.type == MediaPlayer.Event.EncounteredError) {
-            scheduleRetry(mode == 3 ? "硬解播放失败：请检查片源访问，或改用自动 / 软件解码" : "播放失败；请检查直链访问或切换解码方式");
+            stopForSafety("播放内核报告错误，已停止；按 ↓ 手动重试或 ↑ 更换解码方式");
         } else if (event.type == MediaPlayer.Event.EndReached) {
             status = "播放结束";
             show("播放结束；按 ↑ 可重新读取视频\n" + HELP, false);
@@ -284,10 +312,18 @@ public final class MainActivity extends Activity {
 
     void setExternalSubtitle(SubtitleSpec value) {
         externalSubtitle = value; textSelection = 1; desiredSubtitle = Integer.MIN_VALUE;
-        if (active && currentUrl != null) startPlayback(position());
+        if (active && player != null) {
+            if (value == null) { textSelection = 0; desiredSubtitle = -1; player.setSpuTrack(-1); }
+            else {
+                externalAdded = true;
+                if (!player.addSlave(IMedia.Slave.Type.Subtitle, Uri.parse(value.uri), true))
+                    subtitleStatus = "外挂字幕添加失败，请检查文件地址";
+            }
+        }
     }
 
     void setDecoderMode(int value) {
+        if (mode == value) return;
         mode = value;
         getPreferences(MODE_PRIVATE).edit().putInt("decoderMode", mode).apply();
         if (currentUrl != null) startPlayback(position());
@@ -295,9 +331,8 @@ public final class MainActivity extends Activity {
 
     private String decoderName() {
         if (mode == 2) return "软解 + Texture 画面输出";
-        if (mode == 3) return "仅硬件解码（4K 优先尝试）";
-        if (mode == 1) return "软件解码（4K 可能卡顿）";
-        return "自动（硬解优先）";
+        if (mode == 1) return "软件解码（限 2 线程）";
+        return "硬解优先（允许回退）";
     }
 
     private List<MediaPlayer.TrackDescription> tracks(boolean text) {
@@ -342,7 +377,6 @@ public final class MainActivity extends Activity {
             "音轨：‹ " + trackName(false) + " ›（" + tracks(false).size() + " 条）",
             "外挂字幕：‹ " + (externalSubtitle == null ? "不加载" : compact(externalSubtitle.label)) + " ›",
             "解码方式：‹ " + decoderName() + " ›",
-            "网络缓存：‹ " + CACHE_SECONDS[cacheIndex] + " 秒 ›（切换后重新缓冲）",
             "读取 / 刷新远程字幕列表 →",
             "选择电视或 U 盘字幕文件 →",
             "重新读取视频 / 从头播放 →",
@@ -357,14 +391,16 @@ public final class MainActivity extends Activity {
         }
         IMedia.Stats stats = playbackStats();
         text.append('\n').append(compact(subtitleStatus));
-        text.append("\n1.2.1 · LibVLC 3.7.7 · Android ").append(android.os.Build.VERSION.RELEASE);
+        text.append("\n1.2.2 · LibVLC 3.7.7 · Android ").append(android.os.Build.VERSION.RELEASE);
         if (stats != null) text.append("\n视频解码 / 显示：").append(String.valueOf(stats.decodedVideo)).append(" / ")
                 .append(String.valueOf(stats.displayedPictures)).append("  音频解码 / 输出：")
                 .append(String.valueOf(stats.decodedAudio)).append(" / ").append(String.valueOf(stats.playedAbuffers));
         text.append(String.format(Locale.ROOT, "\n缓冲 %.0f%% · 接收 %.1f Mbps · 显示 %.1f 帧/秒", buffering, downloadMbps, displayedFps));
         if (stats != null) text.append(" · 丢帧 ").append(String.valueOf(stats.lostPictures));
         text.append("\n系统 HTTP 检测：").append(connectionStatus);
-        text.append("\n4K 卡顿先试仅硬解；缓存只能缓解网络波动，不能提高解码能力。");
+        text.append('\n').append(memoryStatus);
+        if (recoveryRequired) text.append("\n上次异常停止前：").append(previousSession);
+        text.append("\n未增加网络缓存 · 软解限 2 线程 · 播放错误不自动重试");
         menu.setText(text);
     }
 
@@ -405,18 +441,15 @@ public final class MainActivity extends Activity {
             if (choices.isEmpty()) subtitleStatus = "请先读取字幕列表或选择本地文件";
             else setExternalSubtitle(selected);
         } else if (menuRow == 3) {
-            setDecoderMode((mode + direction + 4) % 4);
+            setDecoderMode((mode + direction + 3) % 3);
         } else if (menuRow == 4) {
-            cacheIndex = (cacheIndex + direction + CACHE_SECONDS.length) % CACHE_SECONDS.length;
-            getPreferences(MODE_PRIVATE).edit().putInt("cacheIndex", cacheIndex).apply();
-            if (currentUrl != null) startPlayback(position());
-        } else if (menuRow == 5) {
             loadSubtitleList();
-        } else if (menuRow == 6) {
+        } else if (menuRow == 5) {
             chooseLocalSubtitle();
+        } else if (menuRow == 6) {
+            failures = 0; safetyStopped = false; recoveryRequired = false;
+            closeMenu(); loadSource(true);
         } else if (menuRow == 7) {
-            failures = 0; closeMenu(); loadSource(true);
-        } else if (menuRow == 8) {
             probeConnection();
         } else closeMenu();
         if (menuOpen) renderMenu();
@@ -425,7 +458,6 @@ public final class MainActivity extends Activity {
     private void probeConnection() {
         if (!active || currentUrl == null) { connectionStatus = "请先成功读取 movie.txt"; return; }
         if (probeRequest != null && !probeRequest.isDone()) return;
-        probeStarted = true;
         connectionStatus = "检测中…（使用系统网络栈，与播放内核可能不同）";
         final String address = currentUrl;
         final Media inspected = media;
@@ -507,6 +539,7 @@ public final class MainActivity extends Activity {
     }
 
     private void scheduleRetry(String message) {
+        if (safetyStopped) return;
         status = message;
         int seconds = Math.min(30, 5 << Math.min(failures++, 3));
         show(message + "\n" + seconds + " 秒后重试；↑ 可切换解码方式", false);
@@ -547,7 +580,10 @@ public final class MainActivity extends Activity {
                 show("播放进度：" + target / 1000 + " 秒\n" + HELP, true);
             } else show("当前视频尚未准备好或不支持快进快退", true);
         } else if (event.getRepeatCount() == 0 && key != KeyEvent.KEYCODE_DPAD_LEFT && key != KeyEvent.KEYCODE_DPAD_RIGHT) {
-            if (player == null) loadSource(true);
+            if (player == null) {
+                safetyStopped = false; recoveryRequired = false; wantPlay = true;
+                loadSource(true);
+            }
             else {
                 wantPlay = !wantPlay;
                 if (wantPlay) player.play(); else player.pause();
@@ -571,7 +607,48 @@ public final class MainActivity extends Activity {
             player.setEventListener(null); player.stop(); player.detachViews(); player.release(); player = null;
         }
         if (media != null) { media.release(); media = null; }
+        if (!recoveryRequired) getPreferences(MODE_PRIVATE).edit().putBoolean("sessionActive", false).apply();
     }
+
+    // Decoder / driver memory is not all included in the Java or native heaps.
+    // These small samples help diagnosis without collecting URLs or movie data.
+    private void sampleMemory() {
+        ActivityManager manager = (ActivityManager)getSystemService(ACTIVITY_SERVICE);
+        if (manager == null) return;
+        ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
+        manager.getMemoryInfo(info);
+        long javaBytes = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+        memoryStatus = String.format(Locale.ROOT, "系统可用 %d MB · Java / 原生堆 %d / %d MB",
+                info.availMem / 1048576, javaBytes / 1048576, Debug.getNativeHeapAllocatedSize() / 1048576);
+        if (player != null) getPreferences(MODE_PRIVATE).edit().putString("lastMemory", memoryStatus).apply();
+        if (info.lowMemory && player != null) stopForSafety("系统报告低内存，已停止并释放播放器；按 ↓ 可手动重试");
+    }
+
+    private void stopForSafety(String reason) {
+        safetyStopped = true; wantPlay = false; generation++;
+        main.removeCallbacks(retry);
+        if (sourceRequest != null) sourceRequest.cancel(true);
+        if (probeRequest != null) probeRequest.cancel(true);
+        savedPosition = position();
+        stopPlayer();
+        status = reason; show(reason, false);
+        if (menuOpen) renderMenu();
+    }
+
+    @SuppressWarnings("deprecation") @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (active && player != null && (level == TRIM_MEMORY_RUNNING_LOW || level == TRIM_MEMORY_RUNNING_CRITICAL))
+            stopForSafety("系统发出低内存通知，已释放播放器；按 ↓ 可手动重试");
+    }
+
+    @SuppressWarnings("deprecation") @Override public void onLowMemory() {
+        super.onLowMemory();
+        if (active && player != null) stopForSafety("系统内存不足，已释放播放器；按 ↓ 可手动重试");
+    }
+
+    int playbackStarts() { return playerStarts; }
+    boolean isSafetyStopped() { return safetyStopped && player == null; }
+
 
     @SuppressWarnings("deprecation") @Override protected void onStop() {
         savedPosition = position(); active = false; generation++; listGeneration++;

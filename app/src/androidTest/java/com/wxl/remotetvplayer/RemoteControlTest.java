@@ -19,17 +19,14 @@ public class RemoteControlTest {
                 org.junit.Assert.assertTrue(menu.getText().toString().contains("字幕轨道"));
                 activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT));
                 org.junit.Assert.assertTrue(menu.getText().toString().contains("关闭"));
-                // Cache and explicit hardware mode are reachable without touch.
+                // Hardware selection is reachable without touch; extra cache settings are gone.
+                org.junit.Assert.assertFalse(menu.getText().toString().contains("网络缓存："));
                 for (int i = 0; i < 3; i++) activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN));
                 activity.setDecoderMode(0);
                 activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT));
-                org.junit.Assert.assertTrue(menu.getText().toString().contains("仅硬件解码"));
-                activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN));
-                activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT));
-                org.junit.Assert.assertTrue(menu.getText().toString().contains("网络缓存：‹ 20 秒"));
-                activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT));
+                org.junit.Assert.assertTrue(menu.getText().toString().contains("Texture"));
                 activity.setDecoderMode(0);
-                for (int i = 0; i < 4; i++) activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_UP));
+                for (int i = 0; i < 3; i++) activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_UP));
                 // Up wraps from the subtitle row to Return; right closes, without an OK key.
                 activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_UP));
                 activity.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT));
