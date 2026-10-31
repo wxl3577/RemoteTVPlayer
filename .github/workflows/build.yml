@@ -71,6 +71,8 @@ jobs:
             ./gradlew --no-daemon connectedDebugAndroidTest
             adb shell am start -n com.wxl.remotetvplayer/.MainActivity
             sleep 3
+            adb shell input keyevent 19
+            sleep 1
             adb shell screencap -p /sdcard/player.png
             adb pull /sdcard/player.png dist/player-smoke.png
       - name: Upload verification reports
@@ -87,9 +89,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="build-${GITHUB_RUN_NUMBER}"
-          printf '%s\n' '启动读取远程 movie.txt 并自动全屏播放。↑ 重新读取，↓ 暂停/继续，← → 快退/快进 10 秒。' '' 'Android 5.0+，可直接侧载的测试签名 APK。已通过单元测试、Lint、模拟器方向键和生命周期检查。源站视频有效性与电视实际解码能力需在设备上验证。' > release-notes.md
+          printf '%s\n' '启动读取远程 movie.txt 并自动全屏播放。↑ 字幕与音轨设置，↓ 暂停/继续，← → 快退/快进 10 秒。支持内嵌字幕、远程外挂字幕及本地字幕文件。' '' 'Android 5.0+，可直接侧载的测试签名 APK。已通过单元测试、Lint、模拟器方向键和生命周期检查。源站视频有效性与电视实际解码能力需在设备上验证。' > release-notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/RemoteTVPlayer.apk dist/SHA256SUMS.txt --clobber
           else
-            gh release create "$tag" dist/RemoteTVPlayer.apk dist/SHA256SUMS.txt --target "$(git rev-parse HEAD)" --title "远程电视播放器 1.0.0（构建 ${GITHUB_RUN_NUMBER}）" --notes-file release-notes.md --prerelease
+            gh release create "$tag" dist/RemoteTVPlayer.apk dist/SHA256SUMS.txt --target "$(git rev-parse HEAD)" --title "远程电视播放器（构建 ${GITHUB_RUN_NUMBER}）" --notes-file release-notes.md --prerelease
           fi
