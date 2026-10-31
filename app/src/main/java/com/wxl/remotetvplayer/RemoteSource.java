@@ -30,7 +30,11 @@ public final class RemoteSource {
     }
 
     public static String fetch() throws IOException {
-        URL url = new URL(TEXT_URL);
+        return parse(fetchText(TEXT_URL));
+    }
+
+    public static String fetchText(String textUrl) throws IOException {
+        URL url = new URL(textUrl);
         for (int redirects = 0; redirects <= 5; redirects++) {
             HttpURLConnection connection = (HttpURLConnection) url.openConnection();
             connection.setConnectTimeout(12000);
@@ -61,7 +65,7 @@ public final class RemoteSource {
                         if (output.size() + count > MAX_BYTES) throw new IOException("movie.txt 超过 64 KB，请只保留视频直链");
                         output.write(buffer, 0, count);
                     }
-                    return parse(new String(output.toByteArray(), StandardCharsets.UTF_8));
+                    return new String(output.toByteArray(), StandardCharsets.UTF_8);
                 }
             } finally {
                 connection.disconnect();
