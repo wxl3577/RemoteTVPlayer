@@ -42,7 +42,8 @@ import java.util.concurrent.Future;
 /** TV-only directional controls, with bundled HEVC and E-AC-3 software decoders. */
 public final class MainActivity extends Activity {
     private static final String HELP = "← / → 快退 / 快进 10 秒    ↓ 暂停 / 继续    ↑ 字幕与解码设置";
-    private static final int ROWS = 8;
+    private static final int ROWS = 10;
+    private static final int[] CACHE_SECONDS = {3, 10, 20};
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService network = Executors.newSingleThreadExecutor();
     private final ExecutorService subtitles = Executors.newSingleThreadExecutor();
@@ -54,13 +55,18 @@ public final class MainActivity extends Activity {
     private MediaPlayer player;
     private Media media;
     private AudioManager audioManager;
-    private Future<?> sourceRequest, subtitleRequest;
-    private boolean active, menuOpen, wantPlay = true, autoSoftware;
+    private Future<?> sourceRequest, subtitleRequest, probeRequest;
+    private boolean active, menuOpen, wantPlay = true;
     private boolean listLoaded, externalAdded, appliedPause;
-    private int generation, listGeneration, menuRow, mode, textSelection = 1, failures;
+    private int generation, listGeneration, menuRow, mode, cacheIndex, textSelection = 1, failures;
     private int desiredAudio = Integer.MIN_VALUE;
     private int desiredSubtitle = Integer.MIN_VALUE;
-    private long savedPosition, pendingSeek, startedAt;
+    private long savedPosition, pendingSeek, sampleAt, previousRead, previousFrames;
+    private float buffering;
+    private boolean probeStarted;
+    private long openedAt;
+    private String connectionStatus = "连接检测：尚未执行";
+    private double downloadMbps, displayedFps;
     private String currentUrl, status = "等待远程播放地址", subtitleStatus = "可读取 subtitle.txt 或选择本地字幕";
     private SubtitleSpec externalSubtitle, localSubtitle;
     private final List<SubtitleSpec> remoteSubtitles = new ArrayList<>();
@@ -71,13 +77,20 @@ public final class MainActivity extends Activity {
             if (!active) return;
             if (player == null) { main.postDelayed(this, 1000); return; }
             IMedia.Stats stats = playbackStats();
-            if (currentUrl != null && wantPlay && mode == 0 && !autoSoftware
-                    && SystemClock.elapsedRealtime() - startedAt > 18000 && stats != null
-                    && stats.demuxReadBytes > 0 && stats.displayedPictures == 0) {
-                autoSoftware = true;
-                subtitleStatus = "未检测到画面输出，自动改用软件解码";
-                startPlayback(Math.max(0, player.getTime()));
+            // Buffering large remote MKVs can take longer than decoder startup. Never
+            // restart the stream or switch to CPU decoding based only on elapsed time.
+            if (stats != null) {
+                long now = SystemClock.elapsedRealtime();
+                long bytes = (stats.readBytes & 0xffffffffL);
+                if (sampleAt > 0 && now > sampleAt) {
+                    long delta = (bytes - previousRead) & 0xffffffffL;
+                    downloadMbps = delta * 8.0 / ((now - sampleAt) * 1000.0);
+                    displayedFps = Math.max(0, stats.displayedPictures - previousFrames) * 1000.0 / (now - sampleAt);
+                }
+                sampleAt = now; previousRead = bytes; previousFrames = stats.displayedPictures;
             }
+            if (!probeStarted && wantPlay && stats != null && stats.readBytes == 0
+                    && SystemClock.elapsedRealtime() - openedAt > 20000) probeConnection();
             if (menuOpen) renderMenu();
             main.postDelayed(this, 1000);
         }
@@ -94,6 +107,7 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         mode = getPreferences(MODE_PRIVATE).getInt("decoderMode", 0);
+        cacheIndex = Math.max(0, Math.min(CACHE_SECONDS.length - 1, getPreferences(MODE_PRIVATE).getInt("cacheIndex", 1)));
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         overlay = new TextView(this);
@@ -126,7 +140,6 @@ public final class MainActivity extends Activity {
             currentUrl = state.getString("url");
             savedPosition = state.getLong("position", 0);
             wantPlay = state.getBoolean("playing", true);
-            autoSoftware = state.getBoolean("autoSoftware", false);
             String uri = state.getString("externalUri");
             if (uri != null) externalSubtitle = new SubtitleSpec(uri, state.getString("externalLabel", "外挂字幕"),
                     state.getString("externalMime", "application/x-subrip"));
@@ -143,7 +156,7 @@ public final class MainActivity extends Activity {
         audioManager = (AudioManager)getSystemService(AUDIO_SERVICE);
         try {
             engine = new LibVLC(this, new ArrayList<>(Arrays.asList(
-                    "--aout=opensles", "--network-caching=3000", "--no-video-title-show",
+                    "--aout=opensles", "--stats", "--no-video-title-show",
                     "--subsdec-encoding=UTF-8", "--sub-language=zh,chi,zho")));
             loadSource(false);
         } catch (RuntimeException | UnsatisfiedLinkError error) {
@@ -164,7 +177,7 @@ public final class MainActivity extends Activity {
                 main.post(() -> {
                     if (!active || ticket != generation) return;
                     long position = !restart && url.equals(currentUrl) ? position() : 0;
-                    if (!url.equals(currentUrl)) { autoSoftware = false; desiredAudio = Integer.MIN_VALUE; }
+                    if (!url.equals(currentUrl)) desiredAudio = Integer.MIN_VALUE;
                     if (restart) wantPlay = true;
                     playResolved(url, position);
                 });
@@ -191,6 +204,9 @@ public final class MainActivity extends Activity {
 
     private void startPlayback(long position) {
         if (!active || engine == null || currentUrl == null) return;
+        if (probeRequest != null) probeRequest.cancel(true);
+        probeStarted = false; connectionStatus = "连接检测：尚未执行";
+        openedAt = SystemClock.elapsedRealtime();
         stopPlayer();
         if (video != null) root.removeView(video);
         video = new VLCVideoLayout(this);
@@ -200,14 +216,19 @@ public final class MainActivity extends Activity {
         player.attachViews(video, null, true, mode == 2);
         player.setEventListener(this::onPlayerEvent);
         media = new Media(engine, Uri.parse(currentUrl));
-        media.addOption(":network-caching=3000");
-        media.setHWDecoderEnabled(mode == 0 && !autoSoftware, false);
+        media.addOption(":network-caching=" + CACHE_SECONDS[cacheIndex] * 1000);
+        if (mode == 3) {
+            // No ",all": make unsupported hardware visible instead of silently
+            // decoding a 4K Main10 stream on an old TV's CPU.
+            media.addOption(":codec=" + (android.os.Build.VERSION.SDK_INT >= 21 ? "mediacodec_ndk" : "mediacodec_jni"));
+        } else media.setHWDecoderEnabled(mode == 0, false);
         media.addOption(":sub-language=zh,chi,zho");
         if (desiredAudio != Integer.MIN_VALUE) media.addOption(":audio-track-id=" + desiredAudio);
         player.setMedia(media);
         pendingSeek = Math.max(0, position);
         savedPosition = pendingSeek;
-        startedAt = SystemClock.elapsedRealtime();
+        sampleAt = previousRead = previousFrames = 0;
+        buffering = 0; downloadMbps = displayedFps = 0;
         externalAdded = false;
         appliedPause = false;
         player.setVolume(100);
@@ -232,16 +253,12 @@ public final class MainActivity extends Activity {
             show(status + "（" + decoderName() + "）\n" + HELP, wantPlay);
         } else if (event.type == MediaPlayer.Event.SeekableChanged) {
             applySeek();
-        } else if (event.type == MediaPlayer.Event.Buffering && event.getBuffering() < 100) {
-            status = "正在缓冲 " + (int)event.getBuffering() + "%";
-            show(status + "（" + decoderName() + "）\n" + HELP, false);
+        } else if (event.type == MediaPlayer.Event.Buffering) {
+            buffering = event.getBuffering();
+            status = buffering < 100 ? "正在缓冲 " + (int)buffering + "%" : wantPlay ? "正在播放" : "已暂停";
+            show(status + "（" + decoderName() + "，缓存 " + CACHE_SECONDS[cacheIndex] + " 秒）\n" + HELP, buffering >= 100 && wantPlay);
         } else if (event.type == MediaPlayer.Event.EncounteredError) {
-            if (mode == 0 && !autoSoftware) {
-                autoSoftware = true;
-                startPlayback(position());
-            } else {
-                scheduleRetry("播放失败；请检查直链有效性，或在设置中切换解码方式");
-            }
+            scheduleRetry(mode == 3 ? "硬解播放失败：请检查片源访问，或改用自动 / 软件解码" : "播放失败；请检查直链访问或切换解码方式");
         } else if (event.type == MediaPlayer.Event.EndReached) {
             status = "播放结束";
             show("播放结束；按 ↑ 可重新读取视频\n" + HELP, false);
@@ -272,14 +289,14 @@ public final class MainActivity extends Activity {
 
     void setDecoderMode(int value) {
         mode = value;
-        autoSoftware = false;
         getPreferences(MODE_PRIVATE).edit().putInt("decoderMode", mode).apply();
         if (currentUrl != null) startPlayback(position());
     }
 
     private String decoderName() {
         if (mode == 2) return "软解 + Texture 画面输出";
-        if (mode == 1 || autoSoftware) return "软件解码";
+        if (mode == 3) return "仅硬件解码（4K 优先尝试）";
+        if (mode == 1) return "软件解码（4K 可能卡顿）";
         return "自动（硬解优先）";
     }
 
@@ -325,9 +342,11 @@ public final class MainActivity extends Activity {
             "音轨：‹ " + trackName(false) + " ›（" + tracks(false).size() + " 条）",
             "外挂字幕：‹ " + (externalSubtitle == null ? "不加载" : compact(externalSubtitle.label)) + " ›",
             "解码方式：‹ " + decoderName() + " ›",
+            "网络缓存：‹ " + CACHE_SECONDS[cacheIndex] + " 秒 ›（切换后重新缓冲）",
             "读取 / 刷新远程字幕列表 →",
             "选择电视或 U 盘字幕文件 →",
             "重新读取视频 / 从头播放 →",
+            "检测片源连接（电视 0% 时使用） →",
             "返回播放 ← / →"
         };
         SpannableStringBuilder text = new SpannableStringBuilder("字幕、音轨与解码\n↑ ↓ 选项目，← → 调整或执行\n\n");
@@ -338,10 +357,14 @@ public final class MainActivity extends Activity {
         }
         IMedia.Stats stats = playbackStats();
         text.append('\n').append(compact(subtitleStatus));
-        text.append("\nLibVLC 3.7.7 · PCM 音频 · Android ").append(android.os.Build.VERSION.RELEASE);
+        text.append("\n1.2.1 · LibVLC 3.7.7 · Android ").append(android.os.Build.VERSION.RELEASE);
         if (stats != null) text.append("\n视频解码 / 显示：").append(String.valueOf(stats.decodedVideo)).append(" / ")
                 .append(String.valueOf(stats.displayedPictures)).append("  音频解码 / 输出：")
                 .append(String.valueOf(stats.decodedAudio)).append(" / ").append(String.valueOf(stats.playedAbuffers));
+        text.append(String.format(Locale.ROOT, "\n缓冲 %.0f%% · 接收 %.1f Mbps · 显示 %.1f 帧/秒", buffering, downloadMbps, displayedFps));
+        if (stats != null) text.append(" · 丢帧 ").append(String.valueOf(stats.lostPictures));
+        text.append("\n系统 HTTP 检测：").append(connectionStatus);
+        text.append("\n4K 卡顿先试仅硬解；缓存只能缓解网络波动，不能提高解码能力。");
         menu.setText(text);
     }
 
@@ -382,15 +405,39 @@ public final class MainActivity extends Activity {
             if (choices.isEmpty()) subtitleStatus = "请先读取字幕列表或选择本地文件";
             else setExternalSubtitle(selected);
         } else if (menuRow == 3) {
-            setDecoderMode((mode + direction + 3) % 3);
+            setDecoderMode((mode + direction + 4) % 4);
         } else if (menuRow == 4) {
-            loadSubtitleList();
+            cacheIndex = (cacheIndex + direction + CACHE_SECONDS.length) % CACHE_SECONDS.length;
+            getPreferences(MODE_PRIVATE).edit().putInt("cacheIndex", cacheIndex).apply();
+            if (currentUrl != null) startPlayback(position());
         } else if (menuRow == 5) {
-            chooseLocalSubtitle();
+            loadSubtitleList();
         } else if (menuRow == 6) {
+            chooseLocalSubtitle();
+        } else if (menuRow == 7) {
             failures = 0; closeMenu(); loadSource(true);
+        } else if (menuRow == 8) {
+            probeConnection();
         } else closeMenu();
         if (menuOpen) renderMenu();
+    }
+
+    private void probeConnection() {
+        if (!active || currentUrl == null) { connectionStatus = "请先成功读取 movie.txt"; return; }
+        if (probeRequest != null && !probeRequest.isDone()) return;
+        probeStarted = true;
+        connectionStatus = "检测中…（使用系统网络栈，与播放内核可能不同）";
+        final String address = currentUrl;
+        final Media inspected = media;
+        probeRequest = network.submit(() -> {
+            String result = SourceProbe.check(address);
+            main.post(() -> {
+                if (!active || inspected != media) return;
+                connectionStatus = result;
+                if (menuOpen) renderMenu();
+                else if (buffering < 1) show(result + "\n按 ↑ 打开设置查看检测结果", false);
+            });
+        });
     }
 
     private void loadSubtitleList() {
@@ -514,7 +561,6 @@ public final class MainActivity extends Activity {
     @Override protected void onSaveInstanceState(Bundle state) {
         super.onSaveInstanceState(state);
         state.putString("url", currentUrl); state.putLong("position", position()); state.putBoolean("playing", wantPlay);
-        state.putBoolean("autoSoftware", autoSoftware);
         if (externalSubtitle != null) {
             state.putString("externalUri", externalSubtitle.uri); state.putString("externalLabel", externalSubtitle.label); state.putString("externalMime", externalSubtitle.mime);
         }
@@ -532,6 +578,7 @@ public final class MainActivity extends Activity {
         main.removeCallbacksAndMessages(null);
         if (sourceRequest != null) sourceRequest.cancel(true);
         if (subtitleRequest != null) subtitleRequest.cancel(true);
+        if (probeRequest != null) probeRequest.cancel(true);
         stopPlayer();
         if (engine != null) { engine.release(); engine = null; }
         if (audioManager != null) audioManager.abandonAudioFocus(focusListener);
