@@ -457,7 +457,7 @@ public final class MainActivity extends Activity {
             if (menuOpen) renderMenu();
             return;
         }
-        try { getContentResolver().takePersistableUriPermission(uri, data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION); }
+        try { getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
         catch (SecurityException ignored) { }
         localSubtitle = new SubtitleSpec(uri.toString(), name, SubtitleSpec.mimeForName(name));
         externalSubtitle = localSubtitle;
