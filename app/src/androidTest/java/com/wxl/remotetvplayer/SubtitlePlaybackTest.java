@@ -56,18 +56,26 @@ public class SubtitlePlaybackTest {
                 if (!decoded.get()) SystemClock.sleep(200);
             }
             assertTrue("HEVC Main10 video / E-AC-3 PCM / external subtitles did not all become active, mode=" + mode, decoded.get());
-            Bitmap screen = InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
-            assertNotNull(screen);
+            // VLC's displayed counter can update before Android's compositor
+            // presents a Texture frame. Require a visible frame, polling through
+            // that asynchronous hand-off instead of taking one immediate shot.
             int coloredPixels = 0;
-            for (int y = screen.getHeight()/3; y < screen.getHeight()*2/3; y += 12) {
-                for (int x = screen.getWidth()/3; x < screen.getWidth()*2/3; x += 12) {
-                    int color = screen.getPixel(x, y);
-                    int max = Math.max(Color.red(color), Math.max(Color.green(color), Color.blue(color)));
-                    int min = Math.min(Color.red(color), Math.min(Color.green(color), Color.blue(color)));
-                    if (max - min > 80 && max > 100) coloredPixels++;
+            long visibleDeadline = SystemClock.elapsedRealtime() + 4000;
+            while (coloredPixels <= 10 && SystemClock.elapsedRealtime() < visibleDeadline) {
+                Bitmap screen = InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
+                assertNotNull(screen);
+                coloredPixels = 0;
+                for (int y = screen.getHeight()/3; y < screen.getHeight()*2/3; y += 12) {
+                    for (int x = screen.getWidth()/3; x < screen.getWidth()*2/3; x += 12) {
+                        int color = screen.getPixel(x, y);
+                        int max = Math.max(Color.red(color), Math.max(Color.green(color), Color.blue(color)));
+                        int min = Math.min(Color.red(color), Math.min(Color.green(color), Color.blue(color)));
+                        if (max - min > 80 && max > 100) coloredPixels++;
+                    }
                 }
+                screen.recycle();
+                if (coloredPixels <= 10) SystemClock.sleep(200);
             }
-            screen.recycle();
             assertTrue("No colored test-pattern frame was visible on the screen", coloredPixels > 10);
         }
     }
